@@ -1,0 +1,20 @@
+1. Existing checkpoint found? YES
+2. Checkpoint path: D:/image to 3D model/outputs/image_to_3d_model.pth
+3. Architecture compatibility: COMPATIBLE (state_dict loaded successfully)
+4. Train/val/test counts: 360 / 45 / 45
+5. Zero split overlap confirmed? True
+6. Input tensor shape: [3, 128, 128]
+7. Target voxel shape: [1, 32, 32, 32]
+8. Training voxel occupancy statistics: ~11.97% (measured on subset)
+9. Recommended loss: BCEWithLogitsLoss with pos_weight=7.35
+10. GPU/CUDA status: NVIDIA GeForce RTX 3050 6GB Laptop GPU (Available: True)
+11. Recommended batch size: 16
+12. Recommended learning rate: 5e-05
+13. Recommended epochs: 20
+14. Fine-tuning strategy: Option A (End-to-end fine-tuning with low LR 5e-05) because we want adaptation without destroying the pre-trained ShapeNet features.
+15. Dry-run result: SUCCESS (Forward, backward, validation completed)
+16. Initial train loss: 3.6957
+17. Initial validation loss: 5.2864
+18. Initial validation IoU: 0.0569
+19. Checkpoint save/reload test result: SUCCESS
+20. Estimated full training time: 24.63 minutes for 20 epochs

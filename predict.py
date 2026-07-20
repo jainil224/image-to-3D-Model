@@ -1,59 +1,25 @@
-"""
-predict.py — Turn one photo into a downloadable 3D model (.glb / .obj)
-
-Usage:
-    python predict.py --image path/to/photo.jpg --checkpoint ./outputs/image_to_3d_model.pth --output ./outputs/result
-
-This loads your trained model and runs it on a single new image (not from the
-training dataset) to produce a real .glb file.
-"""
-
 import argparse
 import os
+import sys
 
 import torch
 import torch.nn as nn
 from PIL import Image
-import torchvision.transforms as T
-
 import numpy as np
+
+# We avoid torchvision and use PIL+numpy to match ToTensor() precisely
+# ToTensor(): PIL (0-255) -> np.float32 (0.0-1.0), and transpose HWC -> CHW
+def preprocess_image(image_path, image_size=128):
+    img = Image.open(image_path).convert("RGB")
+    img = img.resize((image_size, image_size), Image.BILINEAR)
+    arr = np.array(img, dtype=np.float32) / 255.0
+    arr = arr.transpose(2, 0, 1)  # HWC to CHW
+    tensor = torch.from_numpy(arr).unsqueeze(0)  # Add batch dim
+    return tensor
+
 from data_utils import voxels_to_mesh
 
-
-def get_dominant_colors(image_path, n_colors=5):
-    """Extracts the most common colors from the input photo using simple k-means."""
-    img = Image.open(image_path).convert("RGB").resize((100, 100))
-    pixels = np.array(img).reshape(-1, 3).astype(np.float32)
-
-    # simple k-means (no sklearn dependency needed)
-    rng = np.random.default_rng(42)
-    centers = pixels[rng.choice(len(pixels), n_colors, replace=False)]
-    for _ in range(10):
-        dists = np.linalg.norm(pixels[:, None] - centers[None], axis=2)
-        labels = dists.argmin(axis=1)
-        for k in range(n_colors):
-            if (labels == k).any():
-                centers[k] = pixels[labels == k].mean(axis=0)
-    counts = np.bincount(labels, minlength=n_colors)
-    order = np.argsort(-counts)
-    return centers[order].astype(np.uint8)  # sorted most -> least common
-
-
-def colorize_mesh_from_image(mesh, image_path):
-    """Tints the mesh's vertices using the dominant colors of the input photo,
-    varying by height (Y axis) so it isn't a single flat color."""
-    colors = get_dominant_colors(image_path, n_colors=4)
-    verts = mesh.vertices
-    y = verts[:, 1]
-    y_norm = (y - y.min()) / (y.max() - y.min() + 1e-8)
-    bucket = np.clip((y_norm * len(colors)).astype(int), 0, len(colors) - 1)
-    vertex_colors = colors[bucket]
-    mesh.visual.vertex_colors = vertex_colors
-    return mesh
-
-
-# ---- Same model architecture as train.py (must match exactly to load the checkpoint) ----
-
+# ---- Same model architecture as train.py ----
 class ImageEncoder(nn.Module):
     def __init__(self, latent_dim=256):
         super().__init__()
@@ -70,7 +36,6 @@ class ImageEncoder(nn.Module):
         x = self.conv(x).flatten(1)
         return self.fc(x)
 
-
 class VoxelDecoder(nn.Module):
     def __init__(self, latent_dim=256):
         super().__init__()
@@ -85,7 +50,6 @@ class VoxelDecoder(nn.Module):
         x = self.fc(z).view(-1, 256, 4, 4, 4)
         return self.deconv(x)
 
-
 class ImageTo3D(nn.Module):
     def __init__(self, latent_dim=256):
         super().__init__()
@@ -96,43 +60,68 @@ class ImageTo3D(nn.Module):
         z = self.encoder(image)
         return self.decoder(z)
 
-
 def load_model(checkpoint_path, device):
     model = ImageTo3D().to(device)
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    else:
+        state_dict = checkpoint
+        
+    model.load_state_dict(state_dict, strict=True)
     model.eval()
     return model
 
+def image_to_glb(model, image_path, output_path_no_ext, device, threshold=0.5, image_size=128):
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Image not found: {image_path}")
 
-def image_to_glb(model, image_path, output_path_no_ext, device, image_size=128):
-    transform = T.Compose([
-        T.Resize((image_size, image_size)),
-        T.ToTensor(),
-    ])
+    img_tensor = preprocess_image(image_path, image_size).to(device)
+    
+    print(f"Input tensor shape: {img_tensor.shape}")
 
-    img = Image.open(image_path).convert("RGB")
-    img_tensor = transform(img).unsqueeze(0).to(device)
-
-    with torch.no_grad():
+    with torch.inference_mode():
         pred_logits = model(img_tensor)
+        print(f"Output logits shape: {pred_logits.shape}")
+        
         pred_probs = torch.sigmoid(pred_logits)[0, 0].cpu().numpy()
 
-    mesh = voxels_to_mesh(pred_probs)
-    mesh = colorize_mesh_from_image(mesh, image_path)
+    print(f"Probabilities - Min: {pred_probs.min():.4f}, Max: {pred_probs.max():.4f}, Mean: {pred_probs.mean():.4f}")
+    
+    occupied_count = np.sum(pred_probs > threshold)
+    total_voxels = pred_probs.size
+    print(f"Occupied voxels (> {threshold}): {occupied_count} / {total_voxels} ({occupied_count/total_voxels*100:.2f}%)")
 
+    if occupied_count == 0:
+        raise ValueError("Model predicted an entirely empty voxel grid. Cannot generate mesh.")
+
+    # Convert to binary voxel grid for voxels_to_mesh
+    # Wait, voxels_to_mesh takes float values and applies marching cubes at `threshold` internally if we pass probs
+    # It does: `verts, faces, normals, _ = measure.marching_cubes(padded, level=threshold)`
+    # Passing probabilities directly allows smoother meshes, so we pass pred_probs.
+    mesh = voxels_to_mesh(pred_probs, threshold=threshold)
+    
+    print(f"Generated Mesh - Vertices: {len(mesh.vertices)}, Faces: {len(mesh.faces)}")
+
+    # We do NOT try to aggressively color the mesh since it often fails or causes unexpected bugs.
+    # The network predicts geometry, not true textures.
+
+    os.makedirs(os.path.dirname(output_path_no_ext) or '.', exist_ok=True)
     obj_path = output_path_no_ext + ".obj"
     glb_path = output_path_no_ext + ".glb"
+    
     mesh.export(obj_path)
     mesh.export(glb_path)
 
     return obj_path, glb_path
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Convert one image to a 3D model")
     parser.add_argument("--image", type=str, required=True, help="Path to input photo")
-    parser.add_argument("--checkpoint", type=str, default="./outputs/image_to_3d_model.pth")
-    parser.add_argument("--output", type=str, default="./outputs/result", help="Output path WITHOUT extension")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint")
+    parser.add_argument("--output", type=str, required=True, help="Output path WITHOUT extension")
+    parser.add_argument("--threshold", type=float, default=0.5, help="Threshold for occupancy")
     parser.add_argument("--no-cuda", action="store_true")
     args = parser.parse_args()
 
@@ -140,6 +129,7 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
 
     model = load_model(args.checkpoint, device)
-    obj_path, glb_path = image_to_glb(model, args.image, args.output, device)
-
+    
+    obj_path, glb_path = image_to_glb(model, args.image, args.output, device, threshold=args.threshold)
+    
     print(f"Done. Saved:\n  {obj_path}\n  {glb_path}")
