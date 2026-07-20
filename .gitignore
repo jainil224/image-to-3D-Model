@@ -10,3 +10,11 @@ checkpoints/
 uploads/
 .venv/
 .venv-1/
+
+scratch/
+test.mtl
+test.obj
+project_python_files.txt
+*.png
+*.obj
+*.glb
