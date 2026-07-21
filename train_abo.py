@@ -109,7 +109,7 @@ def train_abo():
     image_size = 224
     num_workers = 2
 
-    data_dir = "D:/image to 3D model/data/ABOProcessed5000"
+    data_dir = "D:/image to 3D model/data/ABOProcessed"
     split_path = os.path.join(data_dir, "dataset_split.json")
     out_dir = "D:/image to 3D model/checkpoints/abo_resnet50"
     
@@ -226,7 +226,7 @@ def train_abo():
 
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=3, verbose=True
+        optimizer, mode="max", factor=0.5, patience=3
     )
 
     is_cuda = (device.type == "cuda")

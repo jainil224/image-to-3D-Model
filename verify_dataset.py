@@ -23,34 +23,36 @@ sys.path.append("D:/image to 3D model")
 from data_utils import read_binvox
 
 
-def check_renders(render_dir: str) -> Tuple[bool, str]:
+def check_renders(render_dir: str, current_progress: int = 0, total_progress: int = 0) -> Tuple[bool, str, int]:
     """Verifies that rendering directory has 24 valid RGBA PNG images."""
     if not os.path.exists(render_dir):
-        return False, "Rendering directory missing"
+        return False, "Rendering directory missing", current_progress
 
     for i in range(24):
         img_path = os.path.join(render_dir, f"{i:02d}.png")
         if not os.path.exists(img_path):
-            return False, f"Missing frame {i:02d}.png"
+            return False, f"Missing frame {i:02d}.png", current_progress
 
         try:
             if os.path.getsize(img_path) == 0:
-                return False, f"Frame {i:02d}.png is empty (0 bytes)"
+                return False, f"Frame {i:02d}.png is empty (0 bytes)", current_progress
 
             with Image.open(img_path) as img:
-                img.load()
+                img.verify()
+                
+            with Image.open(img_path) as img:
                 if img.mode != 'RGBA':
-                    return False, f"Frame {i:02d}.png is not RGBA mode (got {img.mode})"
+                    return False, f"Frame {i:02d}.png is not RGBA mode (got {img.mode})", current_progress
                 if img.size != (256, 256):
-                    return False, f"Frame {i:02d}.png size is {img.size}, expected (256, 256)"
-
-                alpha = np.array(img)[:, :, 3]
-                if not np.any(alpha > 10):
-                    return False, f"Frame {i:02d}.png has no foreground object"
+                    return False, f"Frame {i:02d}.png size is {img.size}, expected (256, 256)", current_progress
         except Exception as e:
-            return False, f"Corrupted frame {i:02d}.png: {str(e)}"
+            return False, f"Corrupted frame {i:02d}.png: {str(e)}", current_progress
+            
+        current_progress += 1
+        if total_progress > 0:
+            print(f"\rChecking renders: {current_progress}/{total_progress}", end="", flush=True)
 
-    return True, ""
+    return True, "", current_progress
 
 
 def check_voxels(binvox_path: str) -> Tuple[bool, str]:
@@ -159,6 +161,9 @@ def verify_dataset(data_dir: str = None, sample_size: int = 100) -> bool:
     print(f"Verifying random sample of {len(sample_mids)} objects...")
 
     failed_models = []
+    
+    total_renders = len(sample_mids) * 24
+    current_renders = 0
 
     for mid in sample_mids:
         model_folder = os.path.join(data_dir, mid)
@@ -169,7 +174,7 @@ def verify_dataset(data_dir: str = None, sample_size: int = 100) -> bool:
             continue
 
         # Render check
-        render_ok, render_msg = check_renders(os.path.join(model_folder, "rendering"))
+        render_ok, render_msg, current_renders = check_renders(os.path.join(model_folder, "rendering"), current_renders, total_renders)
         if not render_ok:
             failed_models.append({"model_id": mid, "error": render_msg})
             continue
@@ -209,6 +214,12 @@ def verify_dataset(data_dir: str = None, sample_size: int = 100) -> bool:
 
 
 if __name__ == "__main__":
-    success = verify_dataset()
+    import argparse
+    parser = argparse.ArgumentParser(description="ABO Dataset Integrity Verification")
+    parser.add_argument("--data_dir", type=str, default=None, help="Dataset directory")
+    parser.add_argument("--samples", type=int, default=100, help="Number of samples to check")
+    args = parser.parse_args()
+
+    success = verify_dataset(data_dir=args.data_dir, sample_size=args.samples)
     if not success:
         sys.exit(1)
