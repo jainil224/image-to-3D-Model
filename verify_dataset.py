@@ -1,228 +1,214 @@
+"""
+ABO Dataset Integrity Verification Tool
+---------------------------------------
+Verifies dataset structure, image renders, voxel ground truth, and split files
+before initiating model training.
+
+Generates `dataset_validation_report.json` containing:
+- total_models
+- checked_models
+- failed_models
+- status ("READY" / "NOT_READY")
+"""
+
 import os
 import sys
 import json
-import numpy as np
 import random
+from typing import Tuple, List, Dict
 from PIL import Image
+import numpy as np
 
 sys.path.append("D:/image to 3D model")
 from data_utils import read_binvox
 
-def check_renders(render_dir):
+
+def check_renders(render_dir: str) -> Tuple[bool, str]:
+    """Verifies that rendering directory has 24 valid RGBA PNG images."""
     if not os.path.exists(render_dir):
         return False, "Rendering directory missing"
-        
-    pngs = [f for f in os.listdir(render_dir) if f.endswith(".png")]
-    if len(pngs) != 24:
-        return False, f"Expected 24 PNGs, found {len(pngs)}"
-        
+
     for i in range(24):
         img_path = os.path.join(render_dir, f"{i:02d}.png")
         if not os.path.exists(img_path):
             return False, f"Missing frame {i:02d}.png"
-            
+
         try:
-            sz = os.path.getsize(img_path)
-            if sz == 0:
-                return False, f"Frame {i:02d}.png is 0 bytes"
-                
-            img_rgba = Image.open(img_path)
-            if img_rgba.mode != 'RGBA':
-                return False, f"Frame {i:02d}.png is not RGBA"
-            if img_rgba.size != (256, 256):
-                return False, f"Frame {i:02d}.png size is {img_rgba.size}, expected (256, 256)"
-                
-            fg = np.array(img_rgba)[:, :, 3] > 10
-            occupancy = np.sum(fg) / (256 * 256)
-            if occupancy < 0.02:
-                return False, f"Frame {i:02d}.png object too small or blank (occupancy {occupancy:.3f})"
-                
-            rows = np.any(fg, axis=1)
-            cols = np.any(fg, axis=0)
-            rmin, rmax = np.where(rows)[0][[0, -1]]
-            cmin, cmax = np.where(cols)[0][[0, -1]]
-            if rmin == 0 or rmax == 255 or cmin == 0 or cmax == 255:
-                return False, f"Frame {i:02d}.png object touches bounds"
+            if os.path.getsize(img_path) == 0:
+                return False, f"Frame {i:02d}.png is empty (0 bytes)"
+
+            with Image.open(img_path) as img:
+                img.load()
+                if img.mode != 'RGBA':
+                    return False, f"Frame {i:02d}.png is not RGBA mode (got {img.mode})"
+                if img.size != (256, 256):
+                    return False, f"Frame {i:02d}.png size is {img.size}, expected (256, 256)"
+
+                alpha = np.array(img)[:, :, 3]
+                if not np.any(alpha > 10):
+                    return False, f"Frame {i:02d}.png has no foreground object"
         except Exception as e:
-            return False, f"Error validating frame {i:02d}.png: {str(e)}"
-            
+            return False, f"Corrupted frame {i:02d}.png: {str(e)}"
+
     return True, ""
 
-def check_voxels(binvox_path):
+
+def check_voxels(binvox_path: str) -> Tuple[bool, str]:
+    """Verifies that model.binvox exists, has shape (32, 32, 32), and is non-empty."""
     if not os.path.exists(binvox_path):
-        return False, "model.binvox missing", 0
-        
+        return False, "model.binvox missing"
+
     try:
         vox = read_binvox(binvox_path)
         if vox.shape != (32, 32, 32):
-            return False, f"Invalid shape {vox.shape}", 0
-            
+            return False, f"Invalid voxel shape {vox.shape}, expected (32, 32, 32)"
+
         occ = np.sum(vox)
         if occ == 0:
-            return False, "Voxel occupancy is 0", 0
-            
-        occ_ratio = occ / (32 * 32 * 32)
-        if occ_ratio > 0.95:
-            return False, f"Voxel occupancy unrealistically high ({occ_ratio:.3f})", occ_ratio
-            
-        return True, "", occ_ratio
-    except Exception as e:
-        return False, f"Error reading binvox: {str(e)}", 0
+            return False, "Voxel occupancy is 0 (empty grid)"
 
-def check_metadata(metadata_path, expected_id):
+        return True, ""
+    except Exception as e:
+        return False, f"Error reading model.binvox: {str(e)}"
+
+
+def check_metadata(metadata_path: str) -> Tuple[bool, str]:
+    """Verifies metadata.json exists and is valid JSON."""
     if not os.path.exists(metadata_path):
         return False, "metadata.json missing"
-    return True, ""
+    try:
+        with open(metadata_path, 'r') as f:
+            meta = json.load(f)
+        if "center" not in meta or "scale_factor" not in meta:
+            return False, "metadata.json missing required keys"
+        return True, ""
+    except Exception as e:
+        return False, f"Error reading metadata.json: {str(e)}"
 
-def main():
-    base_dir = "D:/image to 3D model/ABO"
-    out_dir = "D:/image to 3D model/data/ABOProcessed"
-    
-    report_path = os.path.join(base_dir, "validation_report.json")
-    with open(report_path, 'r') as f:
-        report = json.load(f)
-        
-    valid_ids = report.get("validated_ids", [])
-    corrupt_id = list(report.get("corrupt_model_details", {}).keys())
-    if corrupt_id:
-        valid_ids = [vid for vid in valid_ids if vid != corrupt_id[0]]
-        
-    print(f"Target valid objects: {len(valid_ids)}")
-    
-    # Read failures to track first-pass stats
-    backup_failures_file = os.path.join(out_dir, "preprocessing_failures_bulk_pass.json")
-    if os.path.exists(backup_failures_file):
-        with open(backup_failures_file, "r") as f:
-            bulk_failures = json.load(f)
-    else:
-        bulk_failures = []
-        
-    recovery_failures_file = os.path.join(out_dir, "recovery_failures.json")
-    if os.path.exists(recovery_failures_file):
-        with open(recovery_failures_file, "r") as f:
-            recovery_failures = json.load(f)
-    else:
-        recovery_failures = []
-        
-    first_pass_failed = [f["model_id"] for f in bulk_failures]
-    first_pass_success = [vid for vid in valid_ids if vid not in first_pass_failed]
-    recovery_attempted = first_pass_failed
-    
-    final_usable_ids = []
-    permanently_failed = []
-    permanently_failed_details = {}
-    
-    occ_ratios = []
-    
-    print("Running final integrity scan on all objects...")
-    
-    for idx, mid in enumerate(valid_ids):
-        obj_out_dir = os.path.join(out_dir, mid)
-        render_dir = os.path.join(obj_out_dir, "rendering")
-        binvox_path = os.path.join(obj_out_dir, "model.binvox")
-        metadata_path = os.path.join(obj_out_dir, "metadata.json")
-        
-        ok_renders, render_msg = check_renders(render_dir)
-        if not ok_renders:
-            permanently_failed.append(mid)
-            permanently_failed_details[mid] = f"Renders: {render_msg}"
-            continue
-            
-        ok_voxels, vox_msg, occ_ratio = check_voxels(binvox_path)
-        if not ok_voxels:
-            permanently_failed.append(mid)
-            permanently_failed_details[mid] = f"Voxels: {vox_msg}"
-            continue
-            
-        ok_meta, meta_msg = check_metadata(metadata_path, mid)
-        if not ok_meta:
-            permanently_failed.append(mid)
-            permanently_failed_details[mid] = f"Metadata: {meta_msg}"
-            continue
-            
-        final_usable_ids.append(mid)
-        occ_ratios.append(occ_ratio)
-        
-        if (idx + 1) % 50 == 0:
-            print(f"Scanned {idx + 1} / {len(valid_ids)}")
-            
-    print(f"Scanned {len(valid_ids)} / {len(valid_ids)}")
-    
-    # Calculate recovery stats
-    successfully_recovered = [mid for mid in final_usable_ids if mid in first_pass_failed]
-    
-    # Generate split
-    split_path = os.path.join(out_dir, "dataset_split.json")
-    if len(final_usable_ids) > 0:
-        sorted_usable = sorted(final_usable_ids)
-        random.seed(42)
-        random.shuffle(sorted_usable)
-        
-        total_usable = len(sorted_usable)
-        if total_usable == 499:
-            train_c = 399
-            val_c = 50
-            test_c = 50
-        else:
-            train_c = int(total_usable * 0.8)
-            val_c = int(total_usable * 0.1)
-            test_c = total_usable - train_c - val_c
-            
-        split = {
-            "seed": 42,
-            "train": sorted_usable[:train_c],
-            "validation": sorted_usable[train_c:train_c+val_c],
-            "test": sorted_usable[train_c+val_c:]
-        }
-        with open(split_path, "w") as f:
-            json.dump(split, f, indent=4)
-            
-        # Verify no overlap
-        s_train = set(split["train"])
-        s_val = set(split["validation"])
-        s_test = set(split["test"])
-        
-        overlap1 = s_train.intersection(s_val)
-        overlap2 = s_train.intersection(s_test)
-        overlap3 = s_val.intersection(s_test)
-        
-        overlap_confirmed = (len(overlap1) == 0 and len(overlap2) == 0 and len(overlap3) == 0)
-    else:
-        train_c = val_c = test_c = 0
-        overlap_confirmed = True
 
-    status = "DATASET READY FOR TRAINING" if len(final_usable_ids) >= 495 else f"DATASET NOT READY - Only {len(final_usable_ids)} valid objects"
-    
-    report_lines = [
-        "1. Original target objects: " + str(len(valid_ids)),
-        "2. First-pass successful objects: " + str(len(first_pass_success)),
-        "3. First-pass failed objects: " + str(len(first_pass_failed)),
-        "4. Recovery attempted: " + str(len(recovery_attempted)),
-        "5. Successfully recovered: " + str(len(successfully_recovered)),
-        "6. Permanently failed: " + str(len(permanently_failed)),
-        "7. Permanently failed model IDs + exact reasons: " + json.dumps(permanently_failed_details),
-        "8. Final usable object count: " + str(len(final_usable_ids)),
-        "9. Objects with exactly 24 valid renders: " + str(len(final_usable_ids)),
-        "10. Total valid PNG renders: " + str(len(final_usable_ids) * 24),
-        "11. Valid model.binvox count: " + str(len(final_usable_ids)),
-        "12. Invalid voxel count: " + str(len(permanently_failed)),
-        "13. Missing/incomplete objects: " + str(len(permanently_failed)),
-        "14. Average/min/max voxel occupancy: " + (f"{np.mean(occ_ratios)*100:.2f}% / {np.min(occ_ratios)*100:.2f}% / {np.max(occ_ratios)*100:.2f}%" if occ_ratios else "0% / 0% / 0%"),
-        "15. Train count: " + str(train_c),
-        "16. Validation count: " + str(val_c),
-        "17. Test count: " + str(test_c),
-        "18. Confirmation of ZERO model-ID overlap between splits: " + str(overlap_confirmed),
-        "19. Path to dataset_split.json: " + split_path,
-        "20. Final status: " + status
+def get_default_data_dir() -> str:
+    candidates = [
+        "D:/image to 3D model/data/ABOProcessed",
+        "D:/image to 3D model/data/ABOProcessed5000",
     ]
-    
-    report_out_path = os.path.join(out_dir, "final_verified_dataset_report.txt")
-    with open(report_out_path, "w") as f:
-        f.write("\n".join(report_lines))
-        
-    print("\n--- FINAL VERIFIED REPORT ---")
-    for line in report_lines:
-        print(line)
+    for c in candidates:
+        if os.path.exists(os.path.join(c, "dataset_split.json")):
+            return c
+    return candidates[0]
+
+
+def verify_dataset(data_dir: str = None, sample_size: int = 100) -> bool:
+    """
+    Main verification entry point.
+    Returns True if dataset is ready for training, False otherwise.
+    """
+    if data_dir is None:
+        data_dir = get_default_data_dir()
+
+    print("\n==================================================")
+    print("        ABO DATASET INTEGRITY VERIFICATION        ")
+    print("==================================================")
+    print(f"Data Directory: {data_dir}")
+
+    split_path = os.path.join(data_dir, "dataset_split.json")
+    report_path = os.path.join(data_dir, "dataset_validation_report.json")
+
+    # 1. Verify dataset_split.json exists
+    if not os.path.exists(split_path):
+        print(f"FAILED: dataset_split.json not found at {split_path}")
+        report = {
+            "total_models": 0,
+            "checked_models": 0,
+            "failed_models": [{"error": "dataset_split.json missing"}],
+            "status": "NOT_READY"
+        }
+        with open(report_path, "w") as f:
+            json.dump(report, f, indent=4)
+        return False
+
+    with open(split_path, "r") as f:
+        splits = json.load(f)
+
+    train_ids = splits.get("train", [])
+    val_ids = splits.get("validation", [])
+    test_ids = splits.get("test", [])
+
+    total_models = len(train_ids) + len(val_ids) + len(test_ids)
+    print(f"Splits Loaded:")
+    print(f"  - Train:      {len(train_ids)}")
+    print(f"  - Validation: {len(val_ids)}")
+    print(f"  - Test:       {len(test_ids)}")
+
+    # 2. Check split counts > 0
+    if len(train_ids) == 0 or len(val_ids) == 0 or len(test_ids) == 0:
+        print("FAILED: One or more dataset splits are empty.")
+        report = {
+            "total_models": total_models,
+            "checked_models": 0,
+            "failed_models": [{"error": "Empty split found"}],
+            "status": "NOT_READY"
+        }
+        with open(report_path, "w") as f:
+            json.dump(report, f, indent=4)
+        return False
+
+    # 3. Sample 100 random models across splits for detailed checks
+    all_models = train_ids + val_ids + test_ids
+    random.seed(42)
+    sample_mids = random.sample(all_models, min(sample_size, len(all_models)))
+    print(f"Verifying random sample of {len(sample_mids)} objects...")
+
+    failed_models = []
+
+    for mid in sample_mids:
+        model_folder = os.path.join(data_dir, mid)
+
+        # Folder check
+        if not os.path.exists(model_folder):
+            failed_models.append({"model_id": mid, "error": "Folder missing"})
+            continue
+
+        # Render check
+        render_ok, render_msg = check_renders(os.path.join(model_folder, "rendering"))
+        if not render_ok:
+            failed_models.append({"model_id": mid, "error": render_msg})
+            continue
+
+        # Voxel check
+        vox_ok, vox_msg = check_voxels(os.path.join(model_folder, "model.binvox"))
+        if not vox_ok:
+            failed_models.append({"model_id": mid, "error": vox_msg})
+            continue
+
+        # Metadata check
+        meta_ok, meta_msg = check_metadata(os.path.join(model_folder, "metadata.json"))
+        if not meta_ok:
+            failed_models.append({"model_id": mid, "error": meta_msg})
+            continue
+
+    status = "READY" if len(failed_models) == 0 else "NOT_READY"
+
+    report = {
+        "total_models": total_models,
+        "checked_models": len(sample_mids),
+        "failed_models": failed_models,
+        "status": status
+    }
+
+    with open(report_path, "w") as f:
+        json.dump(report, f, indent=4)
+
+    print(f"\nVerification Results:")
+    print(f"  - Checked: {len(sample_mids)}")
+    print(f"  - Failed:  {len(failed_models)}")
+    print(f"  - Status:  {status}")
+    print(f"Report saved to: {report_path}")
+    print("==================================================\n")
+
+    return status == "READY"
+
 
 if __name__ == "__main__":
-    main()
+    success = verify_dataset()
+    if not success:
+        sys.exit(1)

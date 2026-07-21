@@ -1,192 +1,201 @@
-import os
-import glob
-import random
-import argparse
+"""
+Image-to-3D Voxel Reconstruction Model & Utilities
+--------------------------------------------------
+This module defines the upgraded 3D Reconstruction architecture:
+- ResNet50-based Image Encoder (2048-d feature output)
+- Conv3D-based Voxel Decoder (32x32x32 voxel grid output)
+- Combined Loss (BCEWithLogitsLoss + DiceLoss)
+- Evaluation Metrics (IoU, Dice, Precision, Recall)
+- Utility Functions (count_parameters, get_device)
+"""
 
-import numpy as np
-from PIL import Image
-from tqdm import tqdm
-
+from typing import Tuple, Optional
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-import torchvision.transforms as T
-
-from data_utils import read_binvox, voxels_to_mesh
+import torchvision.models as models
+from torchvision.models import ResNet50_Weights
 
 
-CATEGORIES = {
-    "02691156": "airplane",
-    "02958343": "car",
-}
+# =====================================================================
+# 1. ResNet50 Image Encoder
+# =====================================================================
 
-
-class ImageVoxelDataset(Dataset):
-    def __init__(self, samples, image_size=128):
-        self.samples = samples
-        self.transform = T.Compose([
-            T.Resize((image_size, image_size)),
-            T.ToTensor(),
-        ])
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        s = self.samples[idx]
-        view_idx = random.randint(0, 23)
-        img = Image.open(f"{s['render_dir']}/{view_idx:02d}.png").convert("RGB")
-        img_tensor = self.transform(img)
-
-        voxels = read_binvox(s["voxel_path"]).astype("float32")
-        voxel_tensor = torch.from_numpy(voxels).unsqueeze(0)
-
-        return img_tensor, voxel_tensor
-
-
-class ImageEncoder(nn.Module):
-    def __init__(self, latent_dim=256):
+class ResNetEncoder(nn.Module):
+    """
+    Pretrained ResNet50 encoder extracting a 2048-dimensional feature vector.
+    """
+    def __init__(self, pretrained: bool = True):
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(3, 32, 4, 2, 1), nn.BatchNorm2d(32), nn.ReLU(),
-            nn.Conv2d(32, 64, 4, 2, 1), nn.BatchNorm2d(64), nn.ReLU(),
-            nn.Conv2d(64, 128, 4, 2, 1), nn.BatchNorm2d(128), nn.ReLU(),
-            nn.Conv2d(128, 256, 4, 2, 1), nn.BatchNorm2d(256), nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1),
-        )
-        self.fc = nn.Linear(256, latent_dim)
+        weights = ResNet50_Weights.DEFAULT if pretrained else None
+        resnet = models.resnet50(weights=weights)
+        # Remove the final fully-connected classification layer
+        self.backbone = nn.Sequential(*list(resnet.children())[:-1])
 
-    def forward(self, x):
-        x = self.conv(x).flatten(1)
-        return self.fc(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Input shape: (batch_size, 3, H, W)
+        x = self.backbone(x)  # Output shape: (batch_size, 2048, 1, 1)
+        return torch.flatten(x, 1)  # Output shape: (batch_size, 2048)
 
+
+# =====================================================================
+# 2. 3D Voxel Decoder
+# =====================================================================
 
 class VoxelDecoder(nn.Module):
-    def __init__(self, latent_dim=256):
+    """
+    3D ConvTranspose decoder converting 2048-d feature vector to a 32x32x32 voxel grid.
+    """
+    def __init__(self, latent_dim: int = 2048):
         super().__init__()
-        self.fc = nn.Linear(latent_dim, 256 * 4 * 4 * 4)
+        # Project 2048 latent vector to 512 * 4 * 4 * 4
+        self.fc = nn.Linear(latent_dim, 512 * 4 * 4 * 4)
+
         self.deconv = nn.Sequential(
-            nn.ConvTranspose3d(256, 128, 4, 2, 1), nn.BatchNorm3d(128), nn.ReLU(),
-            nn.ConvTranspose3d(128, 64, 4, 2, 1), nn.BatchNorm3d(64), nn.ReLU(),
-            nn.ConvTranspose3d(64, 1, 4, 2, 1),
+            # (512, 4, 4, 4) -> (256, 8, 8, 8)
+            nn.ConvTranspose3d(512, 256, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(256),
+            nn.ReLU(inplace=True),
+
+            # (256, 8, 8, 8) -> (128, 16, 16, 16)
+            nn.ConvTranspose3d(256, 128, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(128),
+            nn.ReLU(inplace=True),
+
+            # (128, 16, 16, 16) -> (64, 32, 32, 32)
+            nn.ConvTranspose3d(128, 64, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(64),
+            nn.ReLU(inplace=True),
+
+            # Final output layer: (64, 32, 32, 32) -> (1, 32, 32, 32)
+            nn.ConvTranspose3d(64, 1, kernel_size=3, stride=1, padding=1)
         )
 
-    def forward(self, z):
-        x = self.fc(z).view(-1, 256, 4, 4, 4)
-        return self.deconv(x)
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        # Input shape: (batch_size, 2048)
+        x = self.fc(z)
+        x = x.view(-1, 512, 4, 4, 4)
+        return self.deconv(x)  # Output shape: (batch_size, 1, 32, 32, 32)
 
+
+# =====================================================================
+# 3. Main ImageTo3D Model API
+# =====================================================================
 
 class ImageTo3D(nn.Module):
-    def __init__(self, latent_dim=256):
+    """
+    End-to-End Image to 3D Voxel Model.
+    Input: RGB Image Tensor (batch_size, 3, H, W)
+    Output: 3D Voxel Logits (batch_size, 1, 32, 32, 32)
+    """
+    def __init__(self, pretrained: bool = True):
         super().__init__()
-        self.encoder = ImageEncoder(latent_dim)
-        self.decoder = VoxelDecoder(latent_dim)
+        self.encoder = ResNetEncoder(pretrained=pretrained)
+        self.decoder = VoxelDecoder(latent_dim=2048)
 
-    def forward(self, image):
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
         z = self.encoder(image)
         return self.decoder(z)
 
 
-def build_samples(data_dir, categories=CATEGORIES):
-    render_root = os.path.join(data_dir, "ShapeNetRendering")
-    voxel_root = os.path.join(data_dir, "ShapeNetVox32")
-    samples = []
-    for cat_id in categories:
-        model_dirs = glob.glob(os.path.join(render_root, cat_id, "*"))
-        for model_dir in model_dirs:
-            model_id = os.path.basename(model_dir)
-            voxel_path = os.path.join(voxel_root, cat_id, model_id, "model.binvox")
-            if os.path.exists(voxel_path):
-                samples.append({
-                    "render_dir": os.path.join(model_dir, "rendering"),
-                    "voxel_path": voxel_path,
-                    "category": categories[cat_id],
-                })
-    return samples
+# =====================================================================
+# 4. Loss Functions
+# =====================================================================
+
+class DiceLoss(nn.Module):
+    """
+    Dice Loss for 3D voxel segmentation to handle severe class imbalance.
+    """
+    def __init__(self, smooth: float = 1e-6):
+        super().__init__()
+        self.smooth = smooth
+
+    def forward(self, pred_logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        probs = torch.sigmoid(pred_logits)
+        probs_flat = probs.view(-1)
+        target_flat = target.view(-1)
+
+        intersection = (probs_flat * target_flat).sum()
+        dice_score = (2.0 * intersection + self.smooth) / (probs_flat.sum() + target_flat.sum() + self.smooth)
+        return 1.0 - dice_score
 
 
-def train(args):
-    device = "cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu"
+_bce_loss_fn = nn.BCEWithLogitsLoss()
+_dice_loss_fn = DiceLoss()
 
-    samples = build_samples(args.data_dir)
-    if len(samples) == 0:
-        print("No samples found. Please download the ShapeNetRendering and ShapeNetVox32 folders into", args.data_dir)
-        return
+def combined_loss(pred: torch.Tensor, target: torch.Tensor, pos_weight: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """
+    Combines Binary Cross-Entropy with Logits and Dice Loss.
+    Supports optional pos_weight for class imbalance handling.
+    """
+    if pos_weight is not None:
+        bce = nn.functional.binary_cross_entropy_with_logits(pred, target, pos_weight=pos_weight)
+    else:
+        bce = _bce_loss_fn(pred, target)
+    dice = _dice_loss_fn(pred, target)
+    return bce + dice
 
-    random.seed(42)
-    random.shuffle(samples)
-    split = int(0.9 * len(samples))
-    train_samples, val_samples = samples[:split], samples[split:]
 
-    train_ds = ImageVoxelDataset(train_samples, image_size=args.image_size)
-    val_ds = ImageVoxelDataset(val_samples, image_size=args.image_size)
+# =====================================================================
+# 5. Evaluation Metrics
+# =====================================================================
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=2)
-
-    model = ImageTo3D().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    criterion = nn.BCEWithLogitsLoss()
-
-    history = {"train_loss": [], "val_loss": []}
-
-    for epoch in range(args.epochs):
-        model.train()
-        train_loss = 0.0
-        for imgs, voxels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}"):
-            imgs, voxels = imgs.to(device), voxels.to(device)
-            optimizer.zero_grad()
-            pred = model(imgs)
-            loss = criterion(pred, voxels)
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item() * imgs.size(0)
-        train_loss /= len(train_ds)
-
-        model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for imgs, voxels in val_loader:
-                imgs, voxels = imgs.to(device), voxels.to(device)
-                pred = model(imgs)
-                val_loss += criterion(pred, voxels).item() * imgs.size(0)
-        val_loss /= len(val_ds)
-
-        history["train_loss"].append(train_loss)
-        history["val_loss"].append(val_loss)
-        print(f"Epoch {epoch+1}/{args.epochs} | train loss: {train_loss:.4f} | val loss: {val_loss:.4f}")
-
-    os.makedirs(args.output_dir, exist_ok=True)
-    ckpt_path = os.path.join(args.output_dir, "image_to_3d_model.pth")
-    torch.save(model.state_dict(), ckpt_path)
-    print("Saved checkpoint to", ckpt_path)
-
-    # export a single prediction
-    model.eval()
-    sample = val_samples[0]
-    img = Image.open(os.path.join(sample['render_dir'], "00.png")).convert("RGB")
-    img_tensor = train_ds.transform(img).unsqueeze(0).to(device)
+def calculate_iou(pred_logits: torch.Tensor, target: torch.Tensor, threshold: float = 0.5, smooth: float = 1e-6) -> float:
+    """Calculates Intersection over Union (IoU) / Jaccard Index."""
     with torch.no_grad():
-        pred_logits = model(img_tensor)
-        pred_probs = torch.sigmoid(pred_logits)[0, 0].cpu().numpy()
-        pred_voxels = pred_probs > 0.5
-
-    mesh = voxels_to_mesh(pred_probs)
-    mesh.export(os.path.join(args.output_dir, "prediction.obj"))
-    mesh.export(os.path.join(args.output_dir, "prediction.glb"))
-    print("Exported prediction.obj and prediction.glb to", args.output_dir)
+        probs = torch.sigmoid(pred_logits)
+        preds = (probs > threshold).float()
+        
+        intersection = (preds * target).sum().item()
+        union = preds.sum().item() + target.sum().item() - intersection
+        return float((intersection + smooth) / (union + smooth))
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser("Train Image->3D voxel model")
-    parser.add_argument('--data-dir', type=str, default='./data', help='Path to folder containing ShapeNetRendering and ShapeNetVox32')
-    parser.add_argument('--epochs', type=int, default=10)
-    parser.add_argument('--batch-size', type=int, default=16)
-    parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--image-size', type=int, default=128)
-    parser.add_argument('--output-dir', type=str, default='./outputs')
-    parser.add_argument('--no-cuda', action='store_true')
-    args = parser.parse_args()
+def calculate_dice(pred_logits: torch.Tensor, target: torch.Tensor, threshold: float = 0.5, smooth: float = 1e-6) -> float:
+    """Calculates Dice Similarity Coefficient (DSC)."""
+    with torch.no_grad():
+        probs = torch.sigmoid(pred_logits)
+        preds = (probs > threshold).float()
+        
+        intersection = (preds * target).sum().item()
+        total = preds.sum().item() + target.sum().item()
+        return float((2.0 * intersection + smooth) / (total + smooth))
 
-    train(args)
+
+def calculate_precision(pred_logits: torch.Tensor, target: torch.Tensor, threshold: float = 0.5, smooth: float = 1e-6) -> float:
+    """Calculates Voxel Reconstruction Precision."""
+    with torch.no_grad():
+        probs = torch.sigmoid(pred_logits)
+        preds = (probs > threshold).float()
+        
+        tp = (preds * target).sum().item()
+        fp = (preds * (1.0 - target)).sum().item()
+        return float((tp + smooth) / (tp + fp + smooth))
+
+
+def calculate_recall(pred_logits: torch.Tensor, target: torch.Tensor, threshold: float = 0.5, smooth: float = 1e-6) -> float:
+    """Calculates Voxel Reconstruction Recall / Sensitivity."""
+    with torch.no_grad():
+        probs = torch.sigmoid(pred_logits)
+        preds = (probs > threshold).float()
+        
+        tp = (preds * target).sum().item()
+        fn = ((1.0 - preds) * target).sum().item()
+        return float((tp + smooth) / (tp + fn + smooth))
+
+
+# =====================================================================
+# 6. Helper Utilities
+# =====================================================================
+
+def count_parameters(model: nn.Module) -> int:
+    """Counts and prints the trainable parameters of a PyTorch model."""
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Trainable Parameters: {trainable_params:,} | Total Parameters: {total_params:,}")
+    return trainable_params
+
+
+def get_device() -> torch.device:
+    """Returns CUDA device if available, otherwise CPU."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return device

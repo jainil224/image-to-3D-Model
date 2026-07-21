@@ -254,7 +254,7 @@ def is_completed(obj_out_dir):
 
 def main():
     base_dir = "D:/image to 3D model/ABO"
-    out_dir = "D:/image to 3D model/data/ABOProcessed"
+    out_dir = "D:/image to 3D model/data/ABOProcessed5000"
     
     blender_script_path = "D:/image to 3D model/blender_render_full.py"
     with open(blender_script_path, "w") as f:
