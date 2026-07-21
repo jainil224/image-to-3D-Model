@@ -24,7 +24,7 @@ def run_inference(image_path: str, weights_path: str, output_path: str, threshol
     if not os.path.exists(weights_path):
         raise FileNotFoundError(f"Weights not found at {weights_path}. Please train the model first.")
         
-    print(f"Loading model weights from {weights_path}...")
+    print("Loading model...")
     # Load model (pretrained=False as we are loading our own trained weights)
     model = ImageTo3D(pretrained=False).to(device)
     
@@ -38,7 +38,7 @@ def run_inference(image_path: str, weights_path: str, output_path: str, threshol
     model.load_state_dict(state_dict)
     model.eval()
     
-    print(f"Loading and preprocessing input image: {image_path}...")
+    print("Processing image...")
     img = Image.open(image_path).convert("RGB")
     transform = T.Compose([
         T.Resize((224, 224)),
@@ -51,7 +51,7 @@ def run_inference(image_path: str, weights_path: str, output_path: str, threshol
     
     input_tensor = transform(img).unsqueeze(0).to(device)
     
-    print("Running inference...")
+    print("Generating voxel grid...")
     with torch.no_grad():
         # Predict logits
         logits = model(input_tensor)
@@ -61,14 +61,18 @@ def run_inference(image_path: str, weights_path: str, output_path: str, threshol
     # Extract the voxel grid (shape: 32, 32, 32)
     voxel_grid = probs.squeeze().cpu().numpy()
     
-    print(f"Converting voxel grid to 3D mesh (threshold={threshold})...")
+    print("Converting voxel to mesh...")
     # Convert probability grid to a Trimesh object
     mesh = voxels_to_mesh(voxel_grid, threshold=threshold)
     
-    print(f"Exporting mesh to {output_path}...")
+    print("Exporting OBJ...")
     mesh.export(output_path)
     
-    print("Inference completed successfully!")
+    glb_output_path = os.path.splitext(output_path)[0] + ".glb"
+    print("Exporting GLB...")
+    mesh.export(glb_output_path)
+    
+    print("Inference completed successfully.")
 
 
 if __name__ == "__main__":
